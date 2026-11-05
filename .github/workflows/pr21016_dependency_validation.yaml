@@ -1,0 +1,102 @@
+name: Temporary PR21016 dependency validation
+
+on:
+  push:
+    branches:
+      - codex/pr21016-dependency-ci-20261105
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr21016-dependency-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream-lint:
+    name: Upstream pre-commit and mypy
+    if: github.repository == 'dontyougetthere/vllm-ascend'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    container:
+      image: quay.io/ascend-ci/vllm-ascend:lint
+    env:
+      PRE_COMMIT_HOME: /tmp/pre-commit-cache
+      SHELLCHECK_OPTS: --exclude=SC2046,SC2006,SC2086
+      GOPROXY: https://repo.huaweicloud.com/repository/goproxy/
+      GONOSUMDB: '*'
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Record source and original PR merge base
+        id: metadata
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git update-ref refs/remotes/origin/pr21016-original-base e5bb836b687799ab710e3572b3455912243027f9
+          git merge-base refs/remotes/origin/pr21016-original-base HEAD
+          git rev-parse HEAD
+          git diff --stat cd5e84c13bd230f6c814128d5b1b8812019d4488 HEAD
+          python3 --version
+          mypy --version
+          printf 'VLLM_REF=%s\n' "$(tr -d '[:space:]' < .github/vllm-main-verified.commit)" >> "$GITHUB_ENV"
+      - name: Checkout the recorded upstream vLLM source for mypy
+        uses: actions/checkout@v7
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ env.VLLM_REF }}
+          path: vllm-empty
+      - name: Run repository format.sh ci without skipping hooks
+        run: |
+          set -euo pipefail
+          export GITHUB_BASE_REF=pr21016-original-base
+          bash format.sh ci 2>&1 | tee /tmp/pr21016-precommit.log
+      - name: Run repository mypy for Python 3.10, 3.11 and 3.12
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/vllm-empty"
+          result=0
+          for python_version in 3.10 3.11 3.12; do
+            bash tools/mypy.sh 1 "$python_version" 2>&1 | tee "/tmp/pr21016-mypy-${python_version}.log" || result=1
+          done
+          exit "$result"
+      - name: Preserve lint logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr21016-lint-logs
+          path: /tmp/pr21016-*.log
+
+  dependency-cpu:
+    name: Existing CPU contracts, baseline versus adapted
+    if: github.repository == 'dontyougetthere/vllm-ascend'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install CPU-only test dependencies
+        run: |
+          python -m pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy
+      - name: Compare existing numerical contracts and the NoPE helper
+        run: |
+          python .github/workflows/scripts/pr21016_dependency_cpu.py \
+            --baseline cd5e84c13bd230f6c814128d5b1b8812019d4488 \
+            --output /tmp/pr21016-cpu-results
+      - name: Preserve CPU results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr21016-cpu-results
+          path: /tmp/pr21016-cpu-results/
