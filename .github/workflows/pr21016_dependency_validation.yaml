@@ -60,7 +60,8 @@ jobs:
         if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
         run: |
           set -uo pipefail
-          export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/vllm-empty"
+          PYTHONPATH="${PYTHONPATH:-}:$(pwd)/vllm-empty"
+          export PYTHONPATH
           result=0
           for python_version in 3.10 3.11 3.12; do
             bash tools/mypy.sh 1 "$python_version" 2>&1 | tee "/tmp/pr21016-mypy-${python_version}.log" || result=1
