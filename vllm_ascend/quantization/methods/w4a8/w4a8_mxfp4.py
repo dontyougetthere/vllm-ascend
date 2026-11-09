@@ -238,10 +238,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
     def get_fused_mc2_weights(self, layer: torch.nn.Module) -> MoEWeights:
         if self.use_expert_weight_list:
             if _EXTRA_CTX.use_mega_moe:
-                w1 = layer.w13_weight_list
-                w2 = layer.w2_weight_list
-                w1_scale = layer.w13_weight_scale_list
-                w2_scale = layer.w2_weight_scale_list
+                w1 = layer.cann_mega_moe_w13_weight_list
+                w2 = layer.cann_mega_moe_w2_weight_list
+                w1_scale = layer.cann_mega_moe_w13_weight_scale_list
+                w2_scale = layer.cann_mega_moe_w2_weight_scale_list
             else:
                 w1, w1_scale, w2, w2_scale = self._get_mlp_weights(layer)
             return MoEWeights(
@@ -348,6 +348,17 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             # gets zero-copy transposed views from _get_mlp_weights.
             layer.w13_weight_scale_list = [scale.clone() for scale in layer.w13_weight_scale.data.unbind(dim=0)]
             layer.w2_weight_scale_list = [scale.clone() for scale in layer.w2_weight_scale.data.unbind(dim=0)]
+            # Build consumer views once. EPLB updates their canonical storage
+            # in place, preserving tensors retained by eager and graph execution.
+            # GMM-SiTU keeps semantic FP4; CANN consumes packed bytes and E8M0.
+            layer.cann_mega_moe_w13_weight_list = [weight.view(torch.uint8) for weight in layer.w13_weight_list]
+            layer.cann_mega_moe_w2_weight_list = [weight.view(torch.uint8) for weight in layer.w2_weight_list]
+            layer.cann_mega_moe_w13_weight_scale_list = [
+                scale.view(torch.float8_e8m0fnu) for scale in layer.w13_weight_scale_list
+            ]
+            layer.cann_mega_moe_w2_weight_scale_list = [
+                scale.view(torch.float8_e8m0fnu) for scale in layer.w2_weight_scale_list
+            ]
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
