@@ -160,6 +160,13 @@ class MooncakeBaseConnectorWorker:
 
         logger.info("Initializing Mooncake worker %s", engine_id)
 
+    def shutdown(self) -> None:
+        """Unregister caches while the NPU context and cache tensors still live."""
+        if self.engine is not None:
+            torch.npu.synchronize()
+            global_te.release_transfer_engine(self.engine)
+            self.engine = None
+
     def _build_kv_cache_spec_mappings(self) -> None:
         """Flatten group specs and map each layer to its group and spec.
 
