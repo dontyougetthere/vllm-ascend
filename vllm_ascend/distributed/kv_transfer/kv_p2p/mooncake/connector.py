@@ -42,6 +42,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
+    MooncakeSchedulerPollMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_scheduler import (
     MooncakePullConnectorScheduler,
@@ -82,12 +83,17 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         self.kv_cache_config = kv_cache_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        self._kimi_model = (
+            getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None) == "kimi_linear"
+        )
         self.connector_scheduler: MooncakeBaseConnectorScheduler | None = None
         self.connector_worker: MooncakeBaseConnectorWorker | None = None
 
     def shutdown(self) -> None:
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
+        if self._kimi_model and self.connector_worker is not None:
+            self.connector_worker.shutdown()
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
@@ -251,6 +257,14 @@ class MooncakePullConnector(MooncakeBaseConnector):
             self.connector_worker = MooncakePullConnectorWorker(vllm_config, str(self.engine_id), kv_cache_config)
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
+
+    def build_connector_worker_meta(self) -> MooncakeSchedulerPollMetadata | None:
+        # Producer ACKs arrive at the host scheduler, not at the worker.
+        # Keep zero-token outputs nonempty so update_connector_output can
+        # drain those ACKs through the normal delayed-free path.
+        if self._kimi_model and self.connector_worker is not None and self.kv_transfer_config.is_kv_producer:
+            return MooncakeSchedulerPollMetadata()
+        return None
 
 
 class MooncakePushConnector(MooncakeBaseConnector):
