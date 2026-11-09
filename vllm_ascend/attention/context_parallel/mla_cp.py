@@ -32,6 +32,13 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     DCPMetadataBuilderMixin,
     use_history_current_split_decode,
 )
+from vllm_ascend.attention.context_parallel.kimi_c8_history_current import (
+    KimiC8CurrentMetadata,
+    KimiC8CurrentWorkspace,
+    forward_kimi_c8_dcp_current,
+    prepare_kimi_c8_metadata,
+    use_kimi_c8_dcp_current,
+)
 from vllm_ascend.attention.utils import MLAPO_MAX_SUPPORTED_TOKENS, AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
@@ -43,6 +50,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.triton.dcp.dcp_a2a import fused_dcp_lse_combine
+from vllm_ascend.ops.triton.mla_high_precision_decode import decode as high_precision_c8_decode
 from vllm_ascend.utils import cp_decode_comm_stream, weak_ref_tensors
 
 
@@ -78,6 +86,7 @@ class AscendMLADCPDecodeMetadata(AscendMLADecodeMetadata):
     cp_seq_len: list[int] | None = None
     dcp_mtp_attn_mask: torch.Tensor = None
     cp_history_seq_len: list[int] | None = None
+    kimi_c8_current: KimiC8CurrentMetadata | None = None
 
     def update_dcp_seq_lens_cpu(
         self,
@@ -290,6 +299,23 @@ class AscendMlaDCPMetadataBuilder(
             kv_rank_offsets=[[rank * toks for rank in self.dcp_collective_rank_order] for toks in seq_tot],
         )
 
+    def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
+        if not (self._hp_c8_enabled and use_kimi_c8_dcp_current(self.vllm_config)):
+            return super().build_for_cudagraph_capture(common_attn_metadata, **kwargs)
+        previous = getattr(self, "_kimi_c8_capture_dummy", False)
+        self._kimi_c8_capture_dummy = True
+        try:
+            return super().build_for_cudagraph_capture(common_attn_metadata, **kwargs)
+        finally:
+            self._kimi_c8_capture_dummy = previous
+
+    def _prepare_hp_c8_decode_metadata(self, common, rows):
+        if self._hp_c8_enabled and use_kimi_c8_dcp_current(self.vllm_config):
+            self._kimi_c8_current_metadata = prepare_kimi_c8_metadata(self, common)
+            current = self._kimi_c8_current_metadata
+            return current.history_lengths, current.history_pages
+        return super()._prepare_hp_c8_decode_metadata(common, rows)
+
     def build_decode_metadata(
         self,
         common_prefix_len: int,
@@ -308,6 +334,7 @@ class AscendMlaDCPMetadataBuilder(
             dcp_rank=self.dcp_rank,
             cp_kv_cache_interleave_size=self.cp_local_block_size,
         )
+        decode_metadata.kimi_c8_current = getattr(self, "_kimi_c8_current_metadata", None)
         decode_metadata.dcp_mtp_attn_mask = None
         return decode_metadata
 
@@ -319,12 +346,14 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
     """
 
     can_return_lse_for_decode: bool = True
+    supports_mixed_c8_dcp: bool = True
     supports_mtp_with_cp_non_trivial_interleave_size: bool = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._dcp_current_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._dcp_prefill_current_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._kimi_c8_current_workspace: KimiC8CurrentWorkspace | None = None
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -339,6 +368,20 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
             # The shared writer contract checks these workspaces. Prepare the
             # projections after them, still inside the loader memory profile.
             self._prepare_prolog_v3_weights_after_loading()
+        if use_kimi_c8_dcp_current(self.vllm_config) and self.use_mixed_kv_cache_store and self.fa_quant_layer:
+            if self._kimi_c8_current_workspace is None:
+                assert self.fused_qkv_a_proj is not None
+                capacity = max(
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    max(self.vllm_config.compilation_config.cudagraph_capture_sizes or [0]),
+                )
+                self._kimi_c8_current_workspace = KimiC8CurrentWorkspace(
+                    capacity,
+                    self.fused_qkv_a_proj.weight.device,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    dcp_size=self.dcp_size,
+                )
 
     def _required_dcp_current_kv_capacity(self) -> int:
         """Upper bound on query rows in a DCP decode graph."""
@@ -431,6 +474,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
                 for key, metadata in attn_metadata[0].items()
                 if getattr(metadata, "decode", None) is not None
                 and getattr(metadata, "external_flashmla", None) is None
+                and getattr(metadata.decode, "hp_c8_seq_lens", None) is None
             ]
         else:
             graph_params = get_graph_params()
@@ -440,6 +484,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
                 for key, metadata in attn_metadata.items()
                 if getattr(metadata, "decode", None) is not None
                 and getattr(metadata, "external_flashmla", None) is None
+                and getattr(metadata.decode, "hp_c8_seq_lens", None) is None
             ]
         # FIXME: Behold! We are using a temporary hack here to update the args
         # for each layer's attention op in the graph.
@@ -929,12 +974,54 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         )
         return self._v_up_proj_batch_major(attn_output)
 
+    def _forward_decode_mixed_c8(self, preprocessed, block_size, metadata):
+        if (
+            use_kimi_c8_dcp_current(self.vllm_config)
+            and not _EXTRA_CTX.is_draft_model
+            and not _EXTRA_CTX.is_draft_model_prefill
+            and self._decode_requires_current_kv(metadata)
+        ):
+            record_attention_compute_start()
+            merged = forward_kimi_c8_dcp_current(self, preprocessed, block_size, metadata)
+            return self._v_up_proj_batch_major(merged)
+        if self.pcp_enabled or self._decode_requires_current_kv(metadata):
+            raise NotImplementedError("Mixed C8 DCP PCP/speculative history-current integration is pending")
+        decode = metadata.decode
+        if decode is None or decode.hp_c8_seq_lens is None or decode.hp_c8_block_table is None:
+            raise RuntimeError("Mixed C8 DCP requires persistent local-length and page-table metadata")
+        query_scale = preprocessed.dequant_scale_q_nope
+        if query_scale is None:
+            raise ValueError("Mixed C8 DCP requires dynamic query descales")
+        query = preprocessed.ql_nope
+        query_rope = preprocessed.q_pe
+        key = preprocessed.k_nope.view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
+        key_rope = preprocessed.k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
+        record_attention_compute_start()
+        partial, lse = high_precision_c8_decode(
+            query,
+            query_rope,
+            key,
+            key_rope,
+            query_scale.contiguous(),
+            self.fak_descale_float,
+            self.fak_descale_float,
+            decode.hp_c8_block_table,
+            decode.hp_c8_seq_lens,
+            self.scale,
+            out_dtype=torch.float32,
+        )
+        # Do not round each rank's partial result to BF16 before global merging.
+        merged = self._merge_dcp_attention_output(partial, lse)
+        return self._v_up_proj_batch_major(merged)
+
     def _forward_decode(
         self,
         decode_preprocess_res: DecodeMLAPreprocessResult,
         block_size: int,
         attn_metadata: AscendMLAMetadata,
     ) -> torch.Tensor:
+        if self.use_mixed_kv_cache_store and self.fa_quant_layer:
+            return self._forward_decode_mixed_c8(decode_preprocess_res, block_size, attn_metadata)
         if self._decode_requires_current_kv(attn_metadata):
             return self._forward_decode_split_attention(
                 decode_preprocess_res.ql_nope,
@@ -1144,7 +1231,14 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         max_seq_len = chunked_context.max_seq_lens[chunk_idx]
         chunk_size: int = chunked_context.chunk_size
         kv_rank_offsets = chunked_context.kv_rank_offsets[chunk_idx]
-        cache_kv_c_k_pe = torch.cat([kv_c_normed, k_pe], dim=-1)
+        # E4M3 values are exactly representable in BF16. Promote only the
+        # gathered chunk for the collective; the caller applies descale once.
+        gathered_latent = kv_c_normed
+        if self.use_mixed_kv_cache_store:
+            if kv_c_normed.dtype != torch.float8_e4m3fn or k_pe.dtype != torch.bfloat16:
+                raise TypeError("Mixed C8 DCP prefill expects FP8 latent and BF16 raw")
+            gathered_latent = kv_c_normed.to(torch.bfloat16)
+        cache_kv_c_k_pe = torch.cat([gathered_latent, k_pe], dim=-1)
         cache_kv_c_k_pe = self._dcp_all_gather(cache_kv_c_k_pe, 0)
 
         allgatered_kv_c_normed, allgatered_k_pe = cache_kv_c_k_pe.split(
