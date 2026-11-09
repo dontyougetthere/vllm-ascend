@@ -14,12 +14,14 @@ from copy import copy
 from typing import Any, TypeVar, cast
 
 import torch
+import torch.distributed as dist
 import vllm.envs as envs
 from torch import nn
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -250,6 +252,33 @@ class AscendKimiMLP(KimiMLP):
         )
         self.use_sequence_parallel = use_sequence_parallel
 
+    def _ordered_sp_reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
+        """Kimi dense MLP BF16 output only: stable TP-rank sum per token shard.
+
+        Keep the producer's entire buffer (including existing padding) and the
+        ordinary SP token ownership. Do not change the public SP, MoE, or
+        decoder-attention fallback paths.
+        """
+        assert partial.ndim == 2 and partial.dtype == torch.bfloat16
+        group = get_tp_group()
+        tp_size = group.world_size
+        assert tp_size > 1
+        pad = (-partial.shape[0]) % tp_size
+        if pad:
+            partial = torch.nn.functional.pad(partial, (0, 0, 0, pad))
+        chunk = partial.shape[0] // tp_size
+        gathered = torch.empty(
+            (tp_size * partial.shape[0], partial.shape[1]),
+            dtype=partial.dtype, device=partial.device,
+        )
+        dist.all_gather_into_tensor(gathered, partial.contiguous(), group=group.device_group)
+        by_rank = gathered.view(tp_size, partial.shape[0], partial.shape[1])
+        first = group.rank_in_group * chunk
+        output = by_rank[0, first:first + chunk].clone()
+        for source_rank in range(1, tp_size):
+            output.add_(by_rank[source_rank, first:first + chunk])
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_sequence_parallel:
             # All weight shards must operate on the same tokens. Reducing
@@ -257,7 +286,15 @@ class AscendKimiMLP(KimiMLP):
             x = sp_all_gather(x)
         x = super().forward(x)
         if self.use_sequence_parallel:
-            x = sp_reduce_scatter(x)
+            if (
+                x.ndim == 2
+                and x.dtype == torch.bfloat16
+                and x.shape[0] > 0
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                x = self._ordered_sp_reduce_scatter(x)
+            else:
+                x = sp_reduce_scatter(x)
         return x
 
 

@@ -48,7 +48,6 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
 
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
@@ -190,6 +189,31 @@ class KimiOProjMMReduceScatterOp(CustomRowParallelOp):
         self.hcom = backend.get_hccl_comm_name(self.tp_rank)
         self.world_size = self.tp_size
 
+    def _ordered_sp_reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
+        """Kimi O-projection fallback only: rank-ordered BF16 SP reference.
+
+        Keep upstream tail padding and token ownership; do not change ordinary
+        SP, Kimi MLP, fused MC2 prefill, or another model's public entry point.
+        """
+        assert partial.ndim == 2 and partial.dtype == torch.bfloat16
+        tp_size = self.tp_size
+        assert tp_size > 1
+        pad = (-partial.shape[0]) % tp_size
+        if pad:
+            partial = torch.nn.functional.pad(partial, (0, 0, 0, pad))
+        chunk = partial.shape[0] // tp_size
+        gathered = torch.empty(
+            (tp_size * partial.shape[0], partial.shape[1]),
+            dtype=partial.dtype, device=partial.device,
+        )
+        dist.all_gather_into_tensor(gathered, partial.contiguous(), group=self.comm_group.device_group)
+        by_rank = gathered.view(tp_size, partial.shape[0], partial.shape[1])
+        first = self.tp_rank * chunk
+        output = by_rank[0, first:first + chunk].clone()
+        for source_rank in range(1, tp_size):
+            output.add_(by_rank[source_rank, first:first + chunk])
+        return output
+
     def apply_impl(self, input_: torch.Tensor) -> tuple[torch.Tensor, None]:
         assert self.quant_method is not None
         input_parallel = self.get_input_parallel(input_)
@@ -199,7 +223,7 @@ class KimiOProjMMReduceScatterOp(CustomRowParallelOp):
         # so the unfused path must return the same token shard as fusion.
         if not self._can_fuse(input_parallel, weight):
             output = self.quant_method.apply(self.layer, input_parallel, None)
-            return sp_reduce_scatter(output), None
+            return self._ordered_sp_reduce_scatter(output), None
         input_parallel = input_parallel.contiguous()
         # sp_reduce_scatter pads the GEMM result. With bias-free O projections,
         # padding the input before the fused GEMM gives the same zero rows.
