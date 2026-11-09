@@ -414,6 +414,9 @@ class AscendCircularBufferSpec(CircularBufferSpec):
 
 
 def register_ascend_kv_cache_specs() -> None:
+    from vllm_ascend.core.kimi_c8_draft_cache import register_kimi_c8_draft_cache_spec
+
+    register_kimi_c8_draft_cache_spec()
     from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
     from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
 

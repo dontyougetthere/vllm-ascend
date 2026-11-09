@@ -50,27 +50,9 @@ from vllm.logger import logger
 # KV cache on the QFA path). Keep the existing members verbatim so other
 # behavior is unchanged.
 _ORIG_CACHE_DTYPE = _cache_mod.CacheDType
-_CACHE_DTYPE_WITH_ASCEND = typing.Literal[
-    "auto",
-    "float16",
-    "bfloat16",
-    "fp8",
-    "fp8_e4m3",
-    "fp8_e5m2",
-    "fp8_inc",
-    "fp8_ds_mla",
-    "turboquant_k8v4",
-    "turboquant_4bit_nc",
-    "turboquant_k3v4_nc",
-    "turboquant_3bit_nc",
-    "int4_per_token_head",
-    "int8_per_token_head",
-    "fp8_per_token_head",
-    "nvfp4",
-    "nvfp4_4over6",
-    "int8",
-    "mxfp8",
-]
+# Extend the runtime's actual upstream members; a hand-written list can drop
+# newer dtypes (for example nvfp4_ds_mla) when the bundled vLLM changes.
+_CACHE_DTYPE_WITH_ASCEND = typing.Literal[(*typing.get_args(_ORIG_CACHE_DTYPE), "int8", "mxfp8")]
 
 
 def _apply_kv_cache_dtype_int8_patch() -> None:
@@ -97,7 +79,7 @@ def _apply_kv_cache_dtype_int8_patch() -> None:
     rebuilds even though ``__pydantic_complete__`` is already True).
     """
     # Idempotency: if int8 is already accepted, nothing to do.
-    existing_args = getattr(_ORIG_CACHE_DTYPE, "__args__", ())
+    existing_args = typing.get_args(_cache_mod.CacheDType)
     if "int8" in existing_args and "mxfp8" in existing_args:
         return
 
@@ -118,3 +100,32 @@ def _apply_kv_cache_dtype_int8_patch() -> None:
 
 
 _apply_kv_cache_dtype_int8_patch()
+
+
+def _apply_draft_kv_cache_dtype_patch() -> None:
+    """Allow the same Ascend KV dtypes in an explicit draft override.
+
+    SpeculativeConfig imported CacheDType before this platform patch and
+    already built its own validator. Rebuilding CacheConfig alone cannot
+    update that captured Literal. Keep None so inheritance still works.
+    """
+    from vllm.config import speculative as speculative_mod
+
+    draft_config_cls = speculative_mod.SpeculativeConfig
+    draft_dtype = _CACHE_DTYPE_WITH_ASCEND | None
+    # Leave an already compatible public schema untouched on repeated setup.
+    if draft_config_cls.__dataclass_fields__["kv_cache_dtype"].type == draft_dtype:
+        return
+    speculative_mod.CacheDType = _CACHE_DTYPE_WITH_ASCEND
+    draft_config_cls.__annotations__["kv_cache_dtype"] = draft_dtype
+    draft_config_cls.__dataclass_fields__["kv_cache_dtype"].type = draft_dtype
+    _pdc.rebuild_dataclass(
+        draft_config_cls,
+        force=True,
+        raise_errors=True,
+        _types_namespace=vars(speculative_mod),
+    )
+    logger.info("Patched SpeculativeConfig.kv_cache_dtype for explicit Ascend draft KV cache dtypes.")
+
+
+_apply_draft_kv_cache_dtype_patch()

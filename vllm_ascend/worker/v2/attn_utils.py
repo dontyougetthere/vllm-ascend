@@ -60,6 +60,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
+    AscendC8MXFPAttentionBackend,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
@@ -68,6 +69,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
+from vllm_ascend.attention.mla_mixed_cache import reshape_mixed_mla_cache
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -195,6 +197,25 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -
                 block_size=spec.block_size * ratio,
                 page_size_padded=max(spec.page_size_padded, page_size) if spec.page_size_padded is not None else None,
             )
+
+
+def _is_kimi_k3_dspark_c8_cache_layer(vllm_config: VllmConfig, layer_name: str, backend: type) -> bool:
+    """Use the draft backend's storage contract inside K3's shared worker."""
+    if getattr(vllm_config.model_config.hf_text_config, "model_type", None) != "kimi_linear":
+        return False
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.method != "dspark":
+        return False
+    from vllm_ascend.attention.kimi_c8_draft import KimiC8DraftBackend
+
+    if backend not in (AscendC8MXFPAttentionBackend, KimiC8DraftBackend):
+        return False
+    parts = layer_name.split(".", 3)
+    if len(parts) != 4 or parts[:2] != ["model", "layers"] or not parts[2].isdecimal():
+        return False
+    target_depth = vllm_config.model_config.get_total_num_hidden_layers()
+    draft_depth = speculative_config.draft_model_config.get_total_num_hidden_layers()
+    return target_depth <= int(parts[2]) < target_depth + draft_depth
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -331,8 +352,21 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             )
             continue
 
-        if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+        if type(spec) is FullAttentionSpec and (
+            is_c8_mxfp_kv_quant(vllm_config)
+            or _is_kimi_k3_dspark_c8_cache_layer(vllm_config, layer_name, getattr(attn_module, "attn_backend", None))
+        ):
             spec = mxfp_cache_spec(spec)
+            from vllm_ascend.worker.v2.spec_decode.dspark.kimi_c8_cp import use_kimi_c8_replicated_draft
+
+            if use_kimi_c8_replicated_draft(vllm_config) and _is_kimi_k3_dspark_c8_cache_layer(
+                vllm_config, layer_name, attn_module.attn_backend
+            ):
+                from vllm_ascend.attention.kimi_c8_draft import KimiC8DraftBackend
+                from vllm_ascend.core.kimi_c8_draft_cache import kimi_c8_draft_full_history_spec
+
+                spec = kimi_c8_draft_full_history_spec(spec)
+                attn_module.attn_backend = KimiC8DraftBackend
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
@@ -602,7 +636,9 @@ def build_attn_metadata(
                         **attn_metadata_extra_kwargs,
                     )
                 else:
-                    if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+                    if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder) or getattr(
+                        attn_metadata_builder, "_hp_c8_enabled", False
+                    ):
                         attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
                     metadata = attn_metadata_builder.build(
                         common_prefix_len=0,
@@ -1577,7 +1613,12 @@ def _reshape_kv_cache_v2(
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
 
-            if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+            from vllm_ascend.core.kimi_c8_draft_cache import is_kimi_c8_draft_full_history
+
+            if (type(kv_cache_spec) is FullAttentionSpec or is_kimi_c8_draft_full_history(kv_cache_spec)) and (
+                is_c8_mxfp_kv_quant(vllm_config)
+                or _is_kimi_k3_dspark_c8_cache_layer(vllm_config, layer_name, group.backend)
+            ):
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
@@ -1897,6 +1938,16 @@ def _reshape_kv_cache_v2(
                 k_cache = raw_k_tensor.view(k_dtype).view(k_shape)
                 v_cache = raw_v_tensor.view(v_dtype).view(v_shape)
                 kv_caches[layer_name] = (k_cache, v_cache)
+            elif isinstance(kv_cache_spec, AscendMLAAttentionSpec) and getattr(
+                vllm_config.compilation_config.static_forward_context[layer_name].impl,
+                "use_mixed_kv_cache_store",
+                False,
+            ):
+                if get_storage_block_size(kv_cache_spec) % kernel_block_size:
+                    raise ValueError("Mixed MLA storage blocks must contain complete kernel blocks.")
+                kv_caches[layer_name] = reshape_mixed_mla_cache(
+                    raw_cache, k_shape, v_shape, k_dtype, v_dtype, page_stride_bytes, num_blocks_per_kv_block
+                )
             else:
                 if k_dtype != v_dtype:
                     raise ValueError("Combined hybrid K/V cache requires matching K/V dtypes.")

@@ -10,7 +10,18 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
+
+
+@dataclass(frozen=True)
+class MooncakeSchedulerPollMetadata(KVConnectorWorkerMetadata):
+    """Keep idle producer outputs alive so the scheduler can drain P/D ACKs."""
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> "MooncakeSchedulerPollMetadata":
+        if not isinstance(other, MooncakeSchedulerPollMetadata):
+            raise TypeError(f"Unexpected Mooncake worker metadata: {type(other).__name__}")
+        return self
 
 
 @dataclass(frozen=True)

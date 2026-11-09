@@ -45,6 +45,7 @@ from vllm_ascend.attention.flashmla import (
     get_flashmla_ops,
     split_flashmla_requests,
 )
+from vllm_ascend.attention.mla_mixed_cache import validate_mixed_mla_quantization, write_mixed_mla_cache
 from vllm_ascend.attention.utils import (
     ATTENTION_UPDATE_MAX_INPUTS,
     MLA_FLASH_SUPPORTED_Q_HEADS,
@@ -217,6 +218,8 @@ class AscendMLADecodeMetadata:
     # Owned by the metadata builder, so it is None for every model that does
     # not need it.
     nope_zero_rope_cache: dict[tuple, torch.Tensor] | None = None
+    hp_c8_seq_lens: torch.Tensor | None = None
+    hp_c8_block_table: torch.Tensor | None = None
 
 
 @dataclass
@@ -278,6 +281,22 @@ class AscendMLAMetadata:
 
 
 M = TypeVar("M", bound=AscendMLAMetadata)
+
+
+def _use_kimi_k3_dspark_hp_c8_multiquery(vllm_config: VllmConfig | None) -> bool:
+    """Keep multiquery HP-C8 decoding within the validated K3 DSpark scope."""
+    model_config = getattr(vllm_config, "model_config", None)
+    text_config = getattr(model_config, "hf_text_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return (
+        getattr(text_config, "model_type", None) == "kimi_linear"
+        and getattr(speculative_config, "method", None) == "dspark"
+        and parallel_config is not None
+        and getattr(parallel_config, "pipeline_parallel_size", 1) in (1, 2)
+        and getattr(parallel_config, "decode_context_parallel_size", 1) == 1
+        and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+    )
 
 
 class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
@@ -359,6 +378,20 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.seq_lens: torch.Tensor = None
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.flashmla_state = None
+        hp_choices = {
+            bool(
+                static_forward_context[name].impl.use_mixed_kv_cache_store
+                and static_forward_context[name].impl.fa_quant_layer
+                and static_forward_context[name].impl.support_fp8_attention
+            )
+            for name in layer_names
+        }
+        if len(hp_choices) > 1:
+            raise NotImplementedError("Mixed HP-C8 and FIA layers in one metadata group are not supported")
+        self._hp_c8_enabled = hp_choices == {True}
+        self._hp_c8_capacity = max(scheduler_config.max_num_seqs, scheduler_config.max_num_batched_tokens)
+        self._hp_c8_lengths = None
+        self._hp_c8_pages = None
         flashmla_choices = {static_forward_context[name].impl.use_flashmla for name in layer_names}
         if len(flashmla_choices) > 1:
             raise ValueError("MLA layers in one attention group must use the same decode backend")
@@ -373,6 +406,96 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             self.flashmla_state = FlashMLAMetadataBuilder(
                 impl, device, scheduler_config.max_num_seqs, self.attn_mask_builder.get_splitfuse_attn_mask()
             )
+
+    def _prepare_hp_c8_decode_metadata(self, common, rows):
+        """Refresh builder-owned, fixed-address inputs before graph replay.
+
+        The device sequence lengths remain authoritative; CPU upper bounds are
+        not copied into a captured kernel. Padded requests have length zero.
+        """
+        if not self._hp_c8_enabled:
+            return None, None
+        query_lens = (
+            common.query_start_loc_cpu[1 : self.num_decodes + 1] - common.query_start_loc_cpu[: self.num_decodes]
+        )
+        if (
+            _use_kimi_k3_dspark_hp_c8_multiquery(getattr(self, "vllm_config", None))
+            and not self.dcp_enabled
+            and not self.pcp_enabled
+            and query_lens.numel() == self.num_decodes
+            and torch.any(query_lens > 1).item()
+        ):
+            return self._prepare_kimi_k3_dspark_hp_c8_multiquery(common, query_lens)
+        if query_lens.numel() != self.num_decodes or not torch.all((query_lens == 0) | (query_lens == 1)).item():
+            raise NotImplementedError("HP-C8 metadata supports one live query per request and zero-query padding")
+        live_rows = min(self.num_decodes, self._hp_c8_actual_reqs)
+        if not torch.all(query_lens[:live_rows] == 1).item() or self.num_decode_tokens != live_rows:
+            raise ValueError("HP-C8 requires one query per real decode request and matching real token counts")
+        # FIA pads the query offsets with virtual one-token requests. Their
+        # query length is therefore not a liveness signal: use the real request
+        # count forwarded by the runner, and leave all padded KV lengths zero.
+        if rows > self._hp_c8_capacity or self.num_decodes > rows:
+            raise ValueError("HP-C8 metadata exceeds retained capacity")
+        seq_source = common.dcp_local_seq_lens if self.dcp_enabled else common.seq_lens
+        if seq_source is None:
+            raise ValueError("HP-C8 DCP requires producer-local device sequence lengths")
+        if seq_source.device != self.block_table.device or seq_source.device.type == "cpu":
+            raise ValueError("HP-C8 metadata requires device-resident sequence lengths")
+        columns = self.block_table.shape[1]
+        if self._hp_c8_lengths is None:
+            self._hp_c8_lengths = torch.empty(self._hp_c8_capacity, dtype=torch.int32, device=self.block_table.device)
+            self._hp_c8_pages = torch.empty(
+                (self._hp_c8_capacity, columns), dtype=torch.int32, device=self.block_table.device
+            )
+        elif self._hp_c8_pages.shape[1] != columns:
+            raise ValueError("HP-C8 page-table width changed after buffer allocation")
+        lengths = self._hp_c8_lengths[:rows]
+        pages = self._hp_c8_pages[:rows]
+        lengths.zero_()
+        pages.zero_()
+        lengths[:live_rows].copy_(seq_source[:live_rows])
+        pages[:live_rows].copy_(self.block_table[:live_rows])
+        return lengths, pages
+
+    def _prepare_kimi_k3_dspark_hp_c8_multiquery(self, common, query_lens):
+        """Give each verifier query its own causal endpoint and page-table row."""
+        live_reqs = min(self.num_decodes, self._hp_c8_actual_reqs)
+        live_query_lens = query_lens[:live_reqs].tolist()
+        if not live_query_lens or any(length <= 0 for length in live_query_lens):
+            raise ValueError("K3 DSpark HP-C8 requires positive query lengths for live requests")
+        if sum(live_query_lens) != self.num_decode_tokens:
+            raise ValueError("K3 DSpark HP-C8 query lengths must match real decode token counts")
+        rows = max(self.num_decode_tokens, self.graph_pad_size)
+        if rows > self._hp_c8_capacity:
+            raise ValueError("HP-C8 metadata exceeds retained capacity")
+        seq_source = common.seq_lens
+        if seq_source is None or seq_source.device != self.block_table.device or seq_source.device.type == "cpu":
+            raise ValueError("HP-C8 metadata requires device-resident sequence lengths")
+        columns = self.block_table.shape[1]
+        if self._hp_c8_lengths is None:
+            self._hp_c8_lengths = torch.empty(self._hp_c8_capacity, dtype=torch.int32, device=self.block_table.device)
+            self._hp_c8_pages = torch.empty(
+                (self._hp_c8_capacity, columns), dtype=torch.int32, device=self.block_table.device
+            )
+        elif self._hp_c8_pages.shape[1] != columns:
+            raise ValueError("HP-C8 page-table width changed after buffer allocation")
+        request_ids = []
+        reverse_offsets = []
+        for request_id, length in enumerate(live_query_lens):
+            request_ids.extend([request_id] * length)
+            reverse_offsets.extend(range(length - 1, -1, -1))
+        device = self.block_table.device
+        indices = torch.tensor(request_ids, dtype=torch.long, device=device)
+        offsets = torch.tensor(reverse_offsets, dtype=torch.int32, device=device)
+        lengths = self._hp_c8_lengths[:rows]
+        pages = self._hp_c8_pages[:rows]
+        lengths.zero_()
+        pages.zero_()
+        # The endpoint comes from the runner's device state, including async
+        # acceptance updates. CPU sequence-length upper bounds are not used.
+        lengths[: self.num_decode_tokens].copy_(seq_source.index_select(0, indices) - offsets)
+        pages[: self.num_decode_tokens].copy_(self.block_table.index_select(0, indices))
+        return lengths, pages
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
@@ -592,7 +715,11 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         *,
         pcp_context=None,
         pcp_cache_group_idx: int | None = None,
+        num_actual_reqs: int | None = None,
     ) -> AscendMLAMetadata:
+        self._hp_c8_actual_reqs = common_attn_metadata.num_reqs if num_actual_reqs is None else num_actual_reqs
+        if not 0 <= self._hp_c8_actual_reqs <= common_attn_metadata.num_reqs:
+            raise ValueError("HP-C8 real request count is outside the metadata request capacity")
         self._pcp_context = pcp_context
         self._pcp_cache_group_idx = pcp_cache_group_idx
         if self.flashmla_state is not None:
@@ -897,6 +1024,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             cos=cos,
             nope_zero_rope_cache=self.nope_zero_rope_cache,
         )
+        if self._hp_c8_enabled:
+            decode_metadata.hp_c8_seq_lens, decode_metadata.hp_c8_block_table = self._prepare_hp_c8_decode_metadata(
+                common_attn_metadata, len(seq_lens_list)
+            )
         return decode_metadata
 
     def build_for_cudagraph_capture(
@@ -965,6 +1096,8 @@ class AscendMLAImpl(MLAAttentionImpl):
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
     """
+
+    use_mixed_kv_cache_store: bool = False
 
     # ``W_UV``/``W_UK_T`` are injected during ``process_weights_after_loading``
     # through ``replace_parameter``, which is ``setattr``-based and therefore
@@ -1104,6 +1237,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 for k in attn_metadata[0]
                 if getattr(attn_metadata[0][k], "decode", None) is not None
                 and getattr(attn_metadata[0][k], "external_flashmla", None) is None
+                and getattr(attn_metadata[0][k].decode, "hp_c8_seq_lens", None) is None
             ]
         else:
             graph_params = get_graph_params()
@@ -1113,6 +1247,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 for k in attn_metadata
                 if getattr(attn_metadata[k], "decode", None) is not None
                 and getattr(attn_metadata[k], "external_flashmla", None) is None
+                and getattr(attn_metadata[k].decode, "hp_c8_seq_lens", None) is None
             ]
         # FIXME: Behold! We are using a temporary hack here to update the args
         # for each layer's attention op in the graph.
@@ -1423,6 +1558,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.quant_kscale = layer.quant_kscale
         self.fak_descale_float = layer.fak_descale_float
         self.fak_descale_reciprocal = layer.fak_descale_reciprocal
+        if self.use_mixed_kv_cache_store:
+            validate_mixed_mla_quantization(
+                self.fak_descale_float,
+                self.fak_descale_reciprocal,
+                layer.fak_offset,
+                layer.fa_v.scale,
+                layer.fa_v.offset,
+            )
 
     def _process_weights_for_fused(self, act_dtype: torch.dtype):
         if self.fa_quant_layer:
@@ -1670,6 +1813,15 @@ class AscendMLAImpl(MLAAttentionImpl):
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
             chunk_out = chunk_out.to(torch.float32)
             chunk_lse = chunk_lse.to(torch.float32)
+            from vllm_ascend.attention.context_parallel.kimi_c8_prefill import (
+                needs_kimi_c8_empty_context_neutralization,
+                neutralize_kimi_c8_empty_context,
+            )
+
+            if needs_kimi_c8_empty_context_neutralization(self):
+                # FIA leaves zero-KV-row LSE unwritten. Use the exact global
+                # cumulative lengths supplied to FIA, never local DCP padding.
+                neutralize_kimi_c8_empty_context(chunk_out, chunk_lse, actual_seq_lengths_q, actual_seq_lengths_kv)
             out_list.append(chunk_out.reshape(num_tokens * H, D))
             lse_list.append(chunk_lse.reshape(num_tokens * H))
             has_context = True
@@ -1784,6 +1936,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
         kv_c_normed = kv_c_normed.view(num_tokens, self.num_kv_heads, self.kv_lora_rank)
         k_pe = k_pe.view(num_tokens, self.num_kv_heads, self.qk_rope_head_dim)
+        if self.use_mixed_kv_cache_store:
+            write_mixed_mla_cache(kv_c_normed, k_pe, kv_cache, slots, self.fak_descale_reciprocal)
+            return k_pe, kv_c_normed
         DeviceOperator.reshape_and_cache(
             key=kv_c_normed,
             value=k_pe,
@@ -2891,6 +3046,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             if self.fa_quant_layer:
                 assert dequant_scale_q_nope is not None
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads)
+                if self.use_mixed_kv_cache_store and self.head_padding > 0:
+                    dequant_scale_q_nope = F.pad(dequant_scale_q_nope, (0, self.head_padding), value=1.0)
         elif self.fa_quant_layer:
             attn_mask = None
             sparse_mode = 0
@@ -2904,6 +3061,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
                 assert dequant_scale_q_nope is not None
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads, 1)
+                if self.use_mixed_kv_cache_store and self.head_padding > 0:
+                    dequant_scale_q_nope = F.pad(dequant_scale_q_nope, (0, 0, 0, self.head_padding), value=1.0)
                 attn_output_shape = (num_tokens, self.num_heads_padded, 1, self.kv_lora_rank)
             else:
                 input_layout = "BSND_NBSD"
@@ -2914,6 +3073,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     q_nope = F.pad(q_nope, (0, 0, 0, self.head_padding), "constant", 0)
                 assert dequant_scale_q_nope is not None
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, 1, self.num_heads)
+                if self.use_mixed_kv_cache_store and self.head_padding > 0:
+                    dequant_scale_q_nope = F.pad(dequant_scale_q_nope, (0, self.head_padding), value=1.0)
                 attn_output_shape = (self.num_heads_padded, num_tokens, 1, self.kv_lora_rank)
         else:
             # The output layout is set to NBSD to eliminate the need for a
@@ -2944,6 +3105,23 @@ class AscendMLAImpl(MLAAttentionImpl):
             # CANN 9.2 FP8 TND_NTD can retain token-major data order.
             # Request native TND and normalize the output in the V projection.
             input_layout = "TND"
+            if self.use_mixed_kv_cache_store:
+                attn_output_shape = (num_tokens, self.num_heads_padded, self.kv_lora_rank)
+
+        if (
+            fp8_token_major_output
+            and input_layout == "BNSD"
+            and self.use_mixed_kv_cache_store
+            and not k_nope.is_contiguous()
+        ):
+            # The mixed NoPE cache has a block stride spanning both components.
+            # CANN accepts that stride for FP8 TND, while BNSD requires packed K.
+            input_layout = "TND"
+            q_nope = q_nope.view(num_tokens, self.num_heads_padded, self.kv_lora_rank)
+            q_pe = q_pe.view(num_tokens, self.num_heads_padded, self.qk_rope_head_dim)
+            assert dequant_scale_q_nope is not None
+            dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads_padded)
+            actual_seq_lengths = list(range(1, num_tokens + 1))
             attn_output_shape = (num_tokens, self.num_heads_padded, self.kv_lora_rank)
 
         # mla_nope_zero_rope64: FIA MLA requires rope D=64. All-zero rope
@@ -2993,7 +3171,36 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Release subsequent layer prefetches at the decode attention boundary,
         # just as prefill and external FlashMLA do.
         record_attention_compute_start()
-        if _EXTRA_CTX.capturing:
+        use_high_precision_c8 = self.use_mixed_kv_cache_store and self.fa_quant_layer and fp8_token_major_output
+        if use_high_precision_c8:
+            if self.dcp_enabled or self.pcp_enabled:
+                raise NotImplementedError("C8 high-precision reader: context-parallel integration is not validated")
+            if input_layout != "TND" or (
+                actual_seq_lengths != list(range(1, num_tokens + 1))
+                and not _use_kimi_k3_dspark_hp_c8_multiquery(self.vllm_config)
+            ):
+                raise NotImplementedError("C8 high-precision reader requires one decode query per request in TND")
+            from vllm_ascend.ops.triton.mla_high_precision_decode import decode as high_precision_c8_decode
+
+            seq_lengths = decode_meta.hp_c8_seq_lens
+            hp_block_table = decode_meta.hp_c8_block_table
+            if seq_lengths is None or hp_block_table is None:
+                raise RuntimeError("HP-C8 decoder requires builder-owned device metadata")
+            if seq_lengths.numel() != num_tokens:
+                raise ValueError("HP-C8 metadata rows do not match decode query rows")
+            attn_output, _ = high_precision_c8_decode(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                dequant_scale_q_nope.contiguous(),
+                self.fak_descale_float,
+                self.fak_descale_float,
+                hp_block_table,
+                seq_lengths,
+                self.scale,
+            )
+        elif _EXTRA_CTX.capturing:
             stream = torch_npu.npu.current_stream()
 
             event = torch.npu.ExternalEvent()
@@ -3499,7 +3706,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not self.enable_kv_nz
             and attn_metadata.num_decode_tokens > 0
         )
-        if use_prolog_v3_strided_cache:
+        if self.use_mixed_kv_cache_store:
+            decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
+                layer_name, hidden_states, kv_cache, attn_metadata
+            )
+        elif use_prolog_v3_strided_cache:
             decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_prolog_v3(
                 hidden_states, kv_cache, attn_metadata
             )

@@ -14,12 +14,14 @@ from copy import copy
 from typing import Any, TypeVar, cast
 
 import torch
+import torch.distributed as dist
 import vllm.envs as envs
 from torch import nn
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -94,7 +96,7 @@ from vllm_ascend.ops.kimi_kda import (
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
-from vllm_ascend.utils import get_rotation_path, is_950
+from vllm_ascend.utils import enable_sfa, get_rotation_path, is_950
 from vllm_ascend.worker.v2.pp_transport import (
     PPTransportDataType,
     add_pp_transport_tensors,
@@ -250,6 +252,33 @@ class AscendKimiMLP(KimiMLP):
         )
         self.use_sequence_parallel = use_sequence_parallel
 
+    def _ordered_sp_reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
+        """Kimi dense MLP BF16 output only: stable TP-rank sum per token shard.
+
+        Keep the producer's entire buffer (including existing padding) and the
+        ordinary SP token ownership. Do not change the public SP, MoE, or
+        decoder-attention fallback paths.
+        """
+        assert partial.ndim == 2 and partial.dtype == torch.bfloat16
+        group = get_tp_group()
+        tp_size = group.world_size
+        assert tp_size > 1
+        pad = (-partial.shape[0]) % tp_size
+        if pad:
+            partial = torch.nn.functional.pad(partial, (0, 0, 0, pad))
+        chunk = partial.shape[0] // tp_size
+        gathered = torch.empty(
+            (tp_size * partial.shape[0], partial.shape[1]),
+            dtype=partial.dtype, device=partial.device,
+        )
+        dist.all_gather_into_tensor(gathered, partial.contiguous(), group=group.device_group)
+        by_rank = gathered.view(tp_size, partial.shape[0], partial.shape[1])
+        first = group.rank_in_group * chunk
+        output = by_rank[0, first:first + chunk].clone()
+        for source_rank in range(1, tp_size):
+            output.add_(by_rank[source_rank, first:first + chunk])
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_sequence_parallel:
             # All weight shards must operate on the same tokens. Reducing
@@ -257,7 +286,15 @@ class AscendKimiMLP(KimiMLP):
             x = sp_all_gather(x)
         x = super().forward(x)
         if self.use_sequence_parallel:
-            x = sp_reduce_scatter(x)
+            if (
+                x.ndim == 2
+                and x.dtype == torch.bfloat16
+                and x.shape[0] > 0
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                x = self._ordered_sp_reduce_scatter(x)
+            else:
+                x = sp_reduce_scatter(x)
         return x
 
 
@@ -461,7 +498,7 @@ class AscendKimiMoE(nn.Module):
 
 
 class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
-    """Extend vLLM's generic Kimi MLA only for DSpark RoPE metadata."""
+    """Configure Kimi-specific MLA cache writes and DSpark RoPE metadata."""
 
     def __init__(
         self,
@@ -501,6 +538,7 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
         if disable_mlapo:
             attention_layer.impl.enable_mlapo = False
             mark_fused_preprocess_weights(attention_layer.impl)
+        self._configure_mixed_kv_cache_store(use_rope)
         if not use_rope and not non_causal_multi_token_decode:
             return
 
@@ -534,6 +572,40 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
         attention_layer.impl.rotary_emb = rotary_emb
         attention_layer.impl.use_mla_rope = use_rope
 
+    def _configure_mixed_kv_cache_store(self, use_rope: bool) -> None:
+        impl = self.impl
+        model_config = impl.vllm_config.model_config
+        if (
+            model_config.hf_config.model_type not in ("kimi_k3", "kimi_linear")
+            or not impl.fa_quant_layer
+            or not impl.support_fp8_attention
+            or use_rope
+            or impl.is_draft_model
+        ):
+            return
+        if impl.enable_kv_nz or impl.pcp_enabled or enable_sfa(impl.vllm_config):
+            raise NotImplementedError("K3 mixed MLA cache requires non-SFA PA layout with PCP=1.")
+        from vllm_ascend.attention.context_parallel.kimi_c8_history_current import use_kimi_c8_dcp_current
+
+        spec = impl.vllm_config.speculative_config
+        independent_draft = (
+            use_kimi_c8_dcp_current(impl.vllm_config)
+            and getattr(getattr(spec, "draft_parallel_config", None), "decode_context_parallel_size", None) == 1
+            and getattr(getattr(spec, "draft_parallel_config", None), "prefill_context_parallel_size", None) == 1
+        )
+        if impl.dcp_enabled and (
+            not getattr(impl, "supports_mixed_c8_dcp", False) or (spec is not None and not independent_draft)
+        ):
+            raise NotImplementedError(
+                "K3 mixed C8 DCP requires ordinary decode or qualified dual-C8 target DCP2 with independent draft CP1"
+            )
+        # K3 static FA stores one 512-wide latent and 64 raw key lanes.
+        supported_geometry = (1, 512, 64)
+        geometry = (impl.num_kv_heads, impl.kv_lora_rank, impl.qk_rope_head_dim)
+        if geometry != supported_geometry or model_config.dtype != torch.bfloat16:
+            raise NotImplementedError("K3 mixed MLA cache requires BF16 inputs and geometry (1, 512, 64).")
+        impl.use_mixed_kv_cache_store = True
+
     @property
     def _attention_layer(self):
         return self.mla_attn.mla_attn
@@ -553,6 +625,10 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     @property
     def kv_cache(self):
         return self._attention_layer.kv_cache
+
+    @kv_cache.setter
+    def kv_cache(self, value):
+        self._attention_layer.kv_cache = value
 
     @property
     def kv_cache_dtype(self):

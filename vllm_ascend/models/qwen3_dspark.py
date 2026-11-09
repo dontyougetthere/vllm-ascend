@@ -1,5 +1,7 @@
+from collections.abc import Iterable
+
 import torch
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
@@ -76,9 +78,20 @@ def align_draft_weights(model, projection, vllm_config):
 class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._draft_vllm_config = vllm_config
 
         config = self.config
         self.enable_confidence_head = bool(getattr(config, "enable_confidence_head", False))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        from vllm_ascend.worker.v2.spec_decode.dspark.kimi_c8_cp import use_kimi_c8_draft_constructor
+
+        if not use_kimi_c8_draft_constructor(self._draft_vllm_config):
+            return super().load_weights(weights)
+        # Native DSpark loading restores the target config after construction.
+        # Scale mapping during weight loading must use this draft's cache dtype.
+        with set_current_vllm_config(self._draft_vllm_config):
+            return super().load_weights(weights)
 
     def compute_confidence(self, head_hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
         """Per-position acceptance probability for each drafted token."""
