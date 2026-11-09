@@ -4,6 +4,7 @@ import math
 from collections import defaultdict
 from dataclasses import replace
 
+import torch
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
 from vllm.logger import logger
@@ -41,6 +42,7 @@ from vllm_ascend.models.glm5next.cache_config import (
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant import cache as tq_cache
+from vllm_ascend.utils import get_kv_cache_tensor_layers
 
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
@@ -145,12 +147,12 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
 ) -> list[KVCacheGroupSpec] | None:
     """Build topology-independent Kimi K3 DSpark scheduler groups.
 
-    Target and causal draft attention layers require the same full-sequence
-    block ownership. Putting them in one UniformType group lets them share one
-    scheduler block table while preserving a separate physical page per layer.
-    Recurrent layers are split into the fewest balanced groups whose size does
-    not exceed the attention group. This minimizes scheduler groups while
-    keeping the recurrent groups balanced.
+    Target and causal draft attention need full-sequence block ownership.
+    Keep C8 MLA target and C8 full-attention draft in separate groups: their
+    backends use different kernel block sizes, even when scheduler blocks and
+    page sizes agree. Other recognized signatures retain shared ownership.
+    Recurrent layers are split into balanced groups no larger than the largest
+    attention group.
 
     Block and page sizes are resolved by the runtime and intentionally not
     fixed here: TP8 and TP16 produce different sizes but the same ownership
@@ -196,22 +198,36 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     if any(spec != first_mamba_spec for spec in mamba_specs.values()):
         return None
 
-    # Insert target attention first. generate_scheduler_kv_cache_config unwraps a
-    # UniformType group to its first spec, and this representative is registered
-    # with the FullAttentionManager needed by both target and draft attention.
-    mixed_attention_specs = {**target_attention_specs, **draft_attention_specs}
-    mixed_attention_spec = UniformTypeKVCacheSpecs.from_specs(mixed_attention_specs)
-    if mixed_attention_spec is None:
-        return None
+    # This branch is restricted to K3's recognized target/draft/recurrent
+    # signature above. Do not change ordinary BF16 draft or MLA draft grouping.
+    from vllm_ascend.core.kimi_c8_draft_cache import is_kimi_c8_draft_full_history
 
-    groups = [
-        KVCacheGroupSpec(
-            layer_names=list(mixed_attention_specs),
-            kv_cache_spec=mixed_attention_spec,
+    separate_c8_draft = all(
+        isinstance(spec, MLAAttentionSpec) and spec.dtype == torch.float8_e4m3fn
+        for spec in target_attention_specs.values()
+    ) and all(
+        (type(spec) is FullAttentionSpec or is_kimi_c8_draft_full_history(spec)) and spec.dtype == torch.float8_e4m3fn
+        for spec in draft_attention_specs.values()
+    )
+    attention_groups = (
+        [target_attention_specs, draft_attention_specs]
+        if separate_c8_draft
+        else [{**target_attention_specs, **draft_attention_specs}]
+    )
+    groups = []
+    for attention_group_specs in attention_groups:
+        uniform_spec = UniformTypeKVCacheSpecs.from_specs(attention_group_specs)
+        if uniform_spec is None:
+            return None
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(attention_group_specs),
+                kv_cache_spec=uniform_spec,
+            )
         )
-    ]
     mamba_layer_names = list(mamba_specs)
-    mamba_group_count = cdiv(len(mamba_layer_names), len(mixed_attention_specs))
+    attention_group_size = max(len(group.layer_names) for group in groups)
+    mamba_group_count = cdiv(len(mamba_layer_names), attention_group_size)
     for group_idx in range(mamba_group_count):
         layer_names = mamba_layer_names[group_idx::mamba_group_count]
         group_specs = {name: mamba_specs[name] for name in layer_names}
@@ -225,10 +241,12 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         )
 
     logger.info(
-        "Using Kimi K3 DSpark mixed KV grouping: %d target + %d draft attention layers, followed by Mamba groups %s",
+        "Using Kimi K3 DSpark KV grouping: %d target + %d draft attention layers "
+        "(separate C8 groups: %s), followed by Mamba groups %s",
         len(target_attention_specs),
         len(draft_attention_specs),
-        [len(group.layer_names) for group in groups[1:]],
+        separate_c8_draft,
+        [len(group.layer_names) for group in groups[len(attention_groups) :]],
     )
     return groups
 
@@ -596,6 +614,80 @@ def _get_glm5_next_kv_cache_groups(
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
+def _remove_kimi_k3_dspark_nonlocal_draft_tensors(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+) -> KVCacheConfig:
+    """Keep PP-local allocation descriptors without renumbering cache groups.
+
+    An empty projected UniformType group retains its global specs for scheduler
+    ownership. The native planner still emits its draft tensor descriptors on
+    the first PP stage. Drop only those wholly nonlocal descriptors, preserving
+    native capacity and every retained tensor's original offset and strides.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    text_config = getattr(model_config, "hf_text_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if not (
+        getattr(text_config, "model_type", None) == "kimi_linear"
+        and getattr(speculative_config, "method", None) == "dspark"
+        and getattr(speculative_config, "kv_cache_dtype", None) == "mxfp8"
+        and getattr(cache_config, "cache_dtype", None) == "fp8"
+        and getattr(parallel_config, "pipeline_parallel_size", 1) == 2
+        and (
+            getattr(parallel_config, "decode_context_parallel_size", 1) == 1
+            or (
+                getattr(parallel_config, "decode_context_parallel_size", 1) == 2
+                and getattr(
+                    getattr(speculative_config, "draft_parallel_config", None), "decode_context_parallel_size", None
+                )
+                == 1
+            )
+        )
+        and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+    ):
+        return kv_cache_config
+
+    local_names = {name for group in kv_cache_config.kv_cache_groups for name in group.layer_names}
+    nonlocal_draft_names = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if group.layer_names or not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        if getattr(parallel_config, "decode_context_parallel_size", 1) == 2:
+            from vllm_ascend.core.kimi_c8_draft_cache import is_kimi_c8_draft_full_history
+
+            if not is_kimi_c8_draft_full_history(spec):
+                continue
+        if spec.kv_cache_specs and all(
+            name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX)
+            and isinstance(layer_spec, FullAttentionSpec)
+            and not isinstance(layer_spec, MLAAttentionSpec)
+            and layer_spec.dtype == torch.float8_e4m3fn
+            for name, layer_spec in spec.kv_cache_specs.items()
+        ):
+            nonlocal_draft_names.update(spec.kv_cache_specs)
+    nonlocal_draft_names.difference_update(local_names)
+    if not nonlocal_draft_names:
+        return kv_cache_config
+
+    retained = []
+    for tensor in kv_cache_config.kv_cache_tensors:
+        names = set(get_kv_cache_tensor_layers(tensor))
+        if names and names <= nonlocal_draft_names:
+            continue
+        if names - local_names:
+            # Unknown or mixed ownership requires the native contract check.
+            # Never compact layer slots: their indices determine view offsets.
+            return kv_cache_config
+        retained.append(tensor)
+    if len(retained) == len(kv_cache_config.kv_cache_tensors):
+        return kv_cache_config
+    return replace(kv_cache_config, kv_cache_tensors=retained)
+
+
 def _ascend_get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -629,6 +721,7 @@ def _ascend_get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
             prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
         )
+    kv_cache_config = _remove_kimi_k3_dspark_nonlocal_draft_tensors(vllm_config, kv_cache_config)
     kv_cache_config.kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is not None and speculative_config.method == "dspark":

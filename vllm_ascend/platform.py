@@ -273,6 +273,16 @@ class NPUPlatform(Platform):
         if get_current_hardware_profile().attention_backend_family is AttentionBackendFamily.COMPATIBILITY:
             return compatibility_backend_map.get(key, compatibility_backend_map[(False, False)])
 
+        # Native DSpark construction retains the target model metadata but
+        # supplies its own CP1/mxfp8 cache config. Select its private backend
+        # before the generic backend consults the process-global DCP cache.
+        if not use_mla and not use_sparse and not use_compress and not attn_selector_config.use_pcp:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_ascend.worker.v2.spec_decode.dspark.kimi_c8_cp import use_kimi_c8_draft_constructor
+
+            if use_kimi_c8_draft_constructor(get_current_vllm_config_or_none()):
+                return "vllm_ascend.attention.kimi_c8_draft.KimiC8DraftBackend"
+
         if attn_selector_config.use_pcp:
             pcp_backend_map = {
                 (True, False, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",
@@ -1776,6 +1786,17 @@ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> N
 
     draft_model_config = speculative_config.draft_model_config
     if draft_model_config is None:
+        return
+
+    from vllm_ascend.worker.v2.spec_decode.dspark.kimi_c8_cp import (
+        use_kimi_c8_replicated_draft,
+        validated_kimi_c8_draft_parallel,
+    )
+
+    if use_kimi_c8_replicated_draft(vllm_config):
+        # This draft owns full-history CP1 pages and executes without target DCP.
+        # Validate actual head counts under that topology; never alter them.
+        speculative_config.draft_parallel_config = validated_kimi_c8_draft_parallel(vllm_config)
         return
 
     # MLA draft models do not use the GQA/MQA head-sharding rules below.

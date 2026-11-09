@@ -65,6 +65,10 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     _lmhead_tp_sample_draft_supported = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        from .kimi_c8_cp import kimi_c8_draft_execution_config, use_kimi_c8_replicated_draft
+
+        self._kimi_c8_replicated_dcp = use_kimi_c8_replicated_draft(vllm_config)
+        vllm_config = kimi_c8_draft_execution_config(vllm_config)
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
@@ -72,6 +76,28 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         self.attn_architecture: str | None = None
         self._draft_mla_uses_device_lengths = False
         self._init_dcp()
+
+    @property
+    def attn_vllm_config(self):
+        base = super().attn_vllm_config
+        if not getattr(self, "_kimi_c8_replicated_dcp", False):
+            return base
+        model = getattr(self, "model", None)
+        if model is None:
+            # Constructor-only topology setup precedes native model loading.
+            return base
+        loaded = getattr(model, "_draft_vllm_config", None)
+        from .kimi_c8_cp import use_kimi_c8_draft_constructor
+
+        if loaded is None or not use_kimi_c8_draft_constructor(loaded):
+            raise ValueError("K3 draft metadata requires its native loaded CP1/mxfp8 configuration")
+        from copy import copy
+
+        from vllm.config import replace
+
+        result = copy(loaded)
+        result.attention_config = replace(loaded.attention_config, use_non_causal=base.attention_config.use_non_causal)
+        return result
 
     def _init_dcp(self) -> None:
         self.use_dcp = self.attn_vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -139,7 +165,19 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
             cudagraph_mode = CUDAGraphMode.NONE
-        super().init_cudagraph_manager(cudagraph_mode)
+        if self._kimi_c8_replicated_dcp:
+            # Construct the manager under its real owner configuration, rather
+            # than correcting only a stored field after buffers/dispatch setup.
+            outer = self.vllm_config
+            owned = self.attn_vllm_config
+            try:
+                self.vllm_config = owned
+                with set_current_vllm_config(owned):
+                    super().init_cudagraph_manager(cudagraph_mode)
+            finally:
+                self.vllm_config = outer
+        else:
+            super().init_cudagraph_manager(cudagraph_mode)
         # The Ascend graph manager is patched onto the upstream module and
         # created by super().init_cudagraph_manager without a speculator ref.
         # It needs this speculator to update full-graph params, so set it here.
@@ -220,6 +258,10 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         target_input_buffers: Any,
         target_attn_groups: Any,
     ) -> None:
+        if self._kimi_c8_replicated_dcp:
+            from .kimi_c8_cp import kimi_c8_draft_table_view
+
+            block_tables = kimi_c8_draft_table_view(block_tables, kv_cache_config, self.draft_attn_layer_names)
         # Initialize the draft attention backend with its PCP=1 config.
         with set_current_vllm_config(self.attn_vllm_config):
             super().set_attn(
@@ -428,6 +470,13 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     ) -> torch.Tensor:
         self.input_batch = input_batch
         assert self.input_batch is not None
+        if self._kimi_c8_replicated_dcp and not dummy_run:
+            # The CP1 drafter owns batch-order buffers independently of the
+            # DCP2 target. Upstream only gathers them for PCP, so refresh this
+            # owner's persistent tables before preparing context/query slots.
+            # Capture and replay keep the same storage; padded rows are zeroed
+            # by the native gather rather than retaining a previous request.
+            self.block_tables.gather_block_tables(input_batch.idx_mapping, num_reqs_padded=self.max_num_reqs)
         # TODO: Remove the adaptive verification condition once upstream vLLM
         # synchronizes the draft DP shape independently of the target.
         # Replicated drafts consume global requests, unlike sharded targets.

@@ -61,6 +61,66 @@ def _use_pp_ipc_runtime_patch(vllm_config, use_pp: bool) -> bool:
     return not getattr(vllm_config, "use_v2_model_runner", False)
 
 
+def _use_kimi_k3_dspark_sync_pp_fence(vllm_config) -> bool:
+    """Do not verify drafts before their preceding sample is committed.
+
+    Synchronous V2 PP queues a newer schedule before consuming the older
+    sample. Draft feedback alone does not advance Request.num_tokens. Keep
+    only that request in flight until its matching output is consumed; other
+    requests and intermediate prefill chunks can still fill the PP pipeline.
+    This scope is deliberately limited to the validated K3 dual-C8 topology.
+    """
+    model = getattr(vllm_config, "model_config", None)
+    text = getattr(model, "hf_text_config", None)
+    spec = getattr(vllm_config, "speculative_config", None)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    cache = getattr(vllm_config, "cache_config", None)
+    return (
+        getattr(vllm_config, "use_v2_model_runner", False)
+        and getattr(scheduler, "async_scheduling", None) is False
+        and getattr(text, "model_type", None) == "kimi_linear"
+        and getattr(spec, "method", None) == "dspark"
+        and getattr(spec, "kv_cache_dtype", None) == "mxfp8"
+        and getattr(cache, "cache_dtype", None) == "fp8"
+        and getattr(parallel, "pipeline_parallel_size", 1) == 2
+        and (
+            getattr(parallel, "decode_context_parallel_size", 1) == 1
+            or (
+                getattr(parallel, "decode_context_parallel_size", 1) == 2
+                and getattr(getattr(spec, "draft_parallel_config", None), "decode_context_parallel_size", None) == 1
+                and getattr(getattr(spec, "draft_parallel_config", None), "prefill_context_parallel_size", None) == 1
+            )
+        )
+        and getattr(parallel, "prefill_context_parallel_size", 1) == 1
+        and getattr(vllm_config, "kv_transfer_config", None) is None
+    )
+
+
+def _fence_kimi_k3_dspark_output(scheduler, scheduler_output) -> None:
+    pending = getattr(scheduler, "_kimi_k3_dspark_pending_outputs", None)
+    if pending is None:
+        pending = scheduler._kimi_k3_dspark_pending_outputs = {}
+    for req_id in scheduler_output.num_scheduled_tokens:
+        request = scheduler.requests.get(req_id)
+        if request is not None and not request.is_prefill_chunk:
+            pending[req_id] = (request, scheduler_output)
+            request.next_decode_eligible_step = _PP_IN_FLIGHT_STEP
+
+
+def _release_kimi_k3_dspark_output(scheduler, scheduler_output) -> None:
+    pending = getattr(scheduler, "_kimi_k3_dspark_pending_outputs", {})
+    for req_id in scheduler_output.num_scheduled_tokens:
+        owner = pending.get(req_id)
+        # An earlier prefill or a stale output must not unlock a newer step.
+        if owner is None or owner[1] is not scheduler_output:
+            continue
+        del pending[req_id]
+        request = scheduler.requests.get(req_id)
+        if request is owner[0]:
+            request.next_decode_eligible_step = 0
+
+
 def _patch_model_runner_output() -> None:
     from vllm.v1 import outputs as outputs_mod
 
@@ -136,6 +196,8 @@ def _patch_scheduler_update_after_schedule() -> None:
     @wraps(original_update_after_schedule)
     def _patched_update_after_schedule(self, scheduler_output):
         original_update_after_schedule(self, scheduler_output)
+        if _use_kimi_k3_dspark_sync_pp_fence(getattr(self, "vllm_config", None)):
+            _fence_kimi_k3_dspark_output(self, scheduler_output)
         if not _use_pp_ipc_runtime_patch(
             getattr(self, "vllm_config", None),
             getattr(self, "use_pp", False),
@@ -275,6 +337,9 @@ def _patch_scheduler_update_from_output() -> None:
             scheduler_output,
             model_runner_output,
         )
+
+        if _use_kimi_k3_dspark_sync_pp_fence(getattr(self, "vllm_config", None)):
+            _release_kimi_k3_dspark_output(self, scheduler_output)
 
         if use_pp_ipc_runtime_patch:
             for req_id in scheduler_output.num_scheduled_tokens:
