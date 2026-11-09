@@ -252,6 +252,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
         block_size = kv_cache_spec.block_size
+        from vllm_ascend.core.kimi_c8_draft_cache import is_kimi_c8_draft_full_history
+
+        if is_kimi_c8_draft_full_history(kv_cache_spec):
+            return block_size
         if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:
             return block_size
         if self.dcp_world_size > 1:

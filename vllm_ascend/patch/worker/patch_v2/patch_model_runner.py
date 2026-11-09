@@ -166,7 +166,17 @@ def initialize_kv_cache(
     )
     if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
         self.fast_prefill = upstream.FastPrefillHelper(self.cudagraph_manager, self.max_num_tokens)
-    upstream.check_attention_cp_compatibility(self.vllm_config, target_attn_layer_names)
+    from vllm_ascend.worker.v2.spec_decode.dspark.kimi_c8_cp import (
+        check_kimi_c8_target_and_draft_cp,
+        use_kimi_c8_replicated_draft,
+    )
+
+    if use_kimi_c8_replicated_draft(self.vllm_config) and isinstance(self.speculator, upstream.DraftModelSpeculator):
+        check_kimi_c8_target_and_draft_cp(
+            self.vllm_config, self.speculator, self.kv_cache_config, upstream.check_attention_cp_compatibility
+        )
+    else:
+        upstream.check_attention_cp_compatibility(self.vllm_config, target_attn_layer_names)
     if isinstance(self.speculator, upstream.DraftModelSpeculator):
         # HACK(woosuk)
         self.speculator.set_attn(

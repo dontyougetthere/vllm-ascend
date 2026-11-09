@@ -47,6 +47,8 @@ def _quant_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
         )
         param.data.copy_(loaded_weight.view_as(param))
 
+    param._c8_v_scale_loaded = True
+
 
 class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     """MXFP8 KV cache storage for dense-attention models.
@@ -60,6 +62,12 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     def __init__(self, quant_description: dict, prefix: str):
         self.quant_description = quant_description
         self.prefix = prefix
+        self.require_v_cache_scale = quant_description.get(
+            "kv_cache_type"
+        ) == "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL" or any(
+            key.endswith(".self_attn.quant_type") and value == "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"
+            for key, value in quant_description.items()
+        )
 
     def create_weights(self, layer: torch.nn.Module) -> None:
         layer.kv_cache_torch_dtype = torch.float8_e4m3fn
@@ -84,11 +92,17 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         layer.register_parameter("v_cache_scale", weight_param)
         # When loading weights, segment them according to TP
         weight_param.weight_loader = _quant_weight_loader
+        weight_param._c8_v_scale_loaded = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         vllm_config = get_current_vllm_config()
         target_dtype = vllm_config.model_config.dtype
+        is_kimi = getattr(vllm_config.model_config.hf_text_config, "model_type", None) == "kimi_linear"
+        if is_kimi and self.require_v_cache_scale and not getattr(layer.v_cache_scale, "_c8_v_scale_loaded", False):
+            raise ValueError(f"Declared MXFP8 recipe missing loaded V-cache scale for {self.prefix}.")
         raw = layer.v_cache_scale.data
+        if is_kimi and bool((raw == 255).any()):
+            raise ValueError(f"Invalid NaN E8M0 V-cache scale for {self.prefix}.")
         # A minmax calibrator emits 0 for a channel whose absmax was 0;
         # sanitize to the neutral 127 so both consumers (the reciprocal below
         # and the raw bytes broadcast into the V-scale cache) stay neutral.
