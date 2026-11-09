@@ -743,8 +743,20 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         are derived on device from the runner's persistent buffers, so every
         replay re-executes the derivation and sees the current step's lengths.
         """
+        kimi_noncausal_draft = False
         if not attn_metadata.causal:
-            raise NotImplementedError("C8_MXFP attention does not support non-causal attention yet.")
+            from vllm_ascend.worker.v2.spec_decode.dspark.kimi_c8_cp import use_kimi_c8_draft_constructor
+
+            kimi_noncausal_draft = (
+                use_kimi_c8_draft_constructor(self.vllm_config)
+                and self.vllm_config.attention_config.use_non_causal
+                and self.head_size == 64
+                and self.alibi_slopes is None
+                and self.sinks is None
+                and output.dtype in (torch.bfloat16, torch.float32)
+            )
+            if not kimi_noncausal_draft:
+                raise NotImplementedError("C8_MXFP attention does not support non-causal attention yet.")
         if self.sliding_window is not None:
             raise NotImplementedError("C8_MXFP attention does not support sliding window attention yet.")
 
@@ -767,6 +779,24 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 "(query_start_loc_gpu / seq_lens_gpu) on AscendMetadata."
             )
         cu_seqlens_q, seqused_kv = self._qfa_step_lengths(attn_metadata, num_tokens)
+        if kimi_noncausal_draft:
+            # Lazy import keeps the Triton reader isolated to its supported
+            # path. The writer and persistent FP8/E8M0 storage stay unchanged.
+            from vllm_ascend.ops.triton.mxfp_high_precision_attention import read
+
+            attn_output, _ = read(
+                quant_query,
+                query_scale,
+                kv_cache,
+                attn_metadata.block_tables,
+                cu_seqlens_q,
+                seqused_kv,
+                self.scale,
+                output_dtype=output.dtype,
+            )
+            output[:num_tokens] = attn_output
+            return output
+
         # The longest single query in the batch -- NOT the batch token total.
         # The metadata op seeds querySeqSize with this attr and only ever
         # raises it, so an inflated value is never walked back.
@@ -777,7 +807,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # a kernel template that never reads the mask; at Q_S == 1 that is
         # exactly equivalent to CAUSAL (the KV range is bounded by seqused_kv).
         # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
-        mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+        mask_mode = QFA_MASK_MODE_NO_MASK if not attn_metadata.causal or max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
 
         # Both operators have to agree on the q scale layout: it is what
         # picks the kernel, and the metadata plan is computed for that kernel.
@@ -806,54 +836,79 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             output=output,
         )
 
-    # KV cache writes happen in reshape_and_cache(), invoked from forward()
-    # when key/value are present. This hook is only reached when attention is
-    # split from cache update (forward_includes_kv_cache_update=False);
-    # AscendAttentionBackend keeps it True, so normal inference never calls
-    # this.
-    def do_kv_cache_update(
-        self,
-        layer: torch.nn.Module,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: list[torch.Tensor],
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        raise NotImplementedError("C8_MXFP KV cache update is only supported via reshape_and_cache in forward().")
+    def _quantize_kv_cache(self, layer, key, value, num_tokens):
+        quant_key, key_scale = torch_npu.npu_dynamic_mx_quant(
+            key[:num_tokens],
+            dst_type=torch.float8_e4m3fn,
+        )
+        quant_value = torch_npu.npu_quantize(
+            value[:num_tokens].reshape(num_tokens, -1),
+            layer.v_cache_scale_float_reciprocal,
+            None,
+            torch.float8_e4m3fn,
+            -1,
+            False,
+        ).reshape((num_tokens, *value.shape[1:]))
+        return quant_key, quant_value, key_scale
 
-    def reshape_and_cache(  # type: ignore[override]
-        self,
-        quant_key: torch.Tensor,
-        quant_value: torch.Tensor,
-        key_scale: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, ...],
-        attn_metadata: AscendMetadata,
-    ) -> None:
-        num_actual_tokens = quant_key.shape[0]
-        slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-        # 5-D PA_NZ packet-packed views: (kernel_blocks, N, D//32, Bs, 32).
-        block_size = key_cache.shape[3]
-
-        # Scatter the K/V payloads through the strided packet views; the
-        # operator's tiling consumes the dim0 stride as the block stride.
+    def _store_quantized_kv(
+        self, quant_key, quant_value, key_scale, value_scale, kv_cache, slot_mapping, slot_index=None
+    ):
         scatter_mxfp_pa_nz_kv_cache(
             quant_key,
             quant_value,
-            key_cache,
-            value_cache,
+            kv_cache[0],
+            kv_cache[1],
             slot_mapping,
         )
-
-        # Only K's scale is per-token; the runner fills static V scales at
-        # setup and restores them when a physical page is reassigned to C8.
+        if slot_index is None:
+            slot_index = mxfp_k_scale_slot_index(slot_mapping, kv_cache[0].shape[3])
         scatter_mxfp_k_scale_cache(
-            # Byte view: index_put_ on float8 falls back to AICPU.
-            key_scale.view(torch.uint8) if key_scale.dtype != torch.uint8 else key_scale,
+            key_scale.view(torch.uint8),
             kv_cache[2],
-            self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
+            slot_index,
         )
+        # An external draft write can follow shared-page reuse. Restore
+        # only addressed V-scale groups before recording write completion.
+        if getattr(self.vllm_config.model_config.hf_text_config, "model_type", None) == "kimi_linear":
+            from vllm_ascend.ops.triton.mxfp_v_scale import scatter_static_v_scales
+
+            scatter_static_v_scales(value_scale, kv_cache[3], slot_mapping)
         notify_kv_cache_written()
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        """Write independently projected draft context using its own scales."""
+        if self.kv_sharing_target_layer_name is not None:
+            return
+        if kv_cache is None or len(kv_cache) < 4:
+            raise RuntimeError("C8_MXFP external update requires four cache components.")
+        num_tokens = key.shape[0]
+        if num_tokens == 0:
+            return
+        if value.shape[0] != num_tokens or slot_mapping.numel() < num_tokens:
+            raise ValueError("C8_MXFP external K/V rows and slot mapping disagree.")
+        quant_key, quant_value, key_scale = self._quantize_kv_cache(layer, key, value, num_tokens)
+        self._store_quantized_kv(
+            quant_key,
+            quant_value,
+            key_scale,
+            layer.v_cache_scale,
+            kv_cache,
+            slot_mapping[:num_tokens],
+        )
+
+    def reshape_and_cache(self, quant_key, quant_value, key_scale, kv_cache, attn_metadata, *, value_scale):
+        slot_mapping = attn_metadata.slot_mapping[: quant_key.shape[0]]
+        slot_index = self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, kv_cache[0].shape[3])
+        self._store_quantized_kv(
+            quant_key,
+            quant_value,
+            key_scale,
+            value_scale,
+            kv_cache,
+            slot_mapping,
+            slot_index,
+        )
 
     def forward(
         self,
@@ -905,24 +960,20 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
-            key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                key[: attn_metadata.num_actual_tokens],
-                dst_type=torch.float8_e4m3fn,
+            key_mxfp8, value_mxfp8, key_scale = self._quantize_kv_cache(
+                layer,
+                key,
+                value,
+                attn_metadata.num_actual_tokens,
             )
-
-            original_value_shape = value.shape
-            value = value.view(original_value_shape[0], -1)
-            value_mxfp8 = torch_npu.npu_quantize(
-                value[: attn_metadata.num_actual_tokens],
-                layer.v_cache_scale_float_reciprocal,
-                None,
-                torch.float8_e4m3fn,
-                -1,
-                False,
+            self.reshape_and_cache(
+                key_mxfp8,
+                value_mxfp8,
+                key_scale,
+                kv_cache,
+                attn_metadata,
+                value_scale=layer.v_cache_scale,
             )
-            value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
-
-            self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.

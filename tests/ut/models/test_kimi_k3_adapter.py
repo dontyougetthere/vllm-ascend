@@ -155,7 +155,11 @@ def test_kimi_disabling_mlapo_refreshes_projection_nz_management():
         impl.fused_qkv_a_proj, impl.q_proj = projections
         mark_fused_preprocess_weights(impl)
         assert impl.fused_qkv_a_proj._fused_preprocess_managed
+        # This fixture deliberately skips the upstream constructor and only
+        # supplies projection/NZ metadata. Cache-layout configuration has a
+        # separate contract; do not pretend this partial impl has a VllmConfig.
         with (
+            patch.object(kimi_k3.AscendKimiMLAAttention, "_configure_mixed_kv_cache_store") as configure_cache,
             patch.object(kimi_k3.UpstreamKimiMLAAttention, "__init__", lambda self, **kwargs: nn.Module.__init__(self)),
             patch.object(
                 kimi_k3.AscendKimiMLAAttention,
@@ -177,6 +181,7 @@ def test_kimi_disabling_mlapo_refreshes_projection_nz_management():
                 use_rope=False,
                 disable_mlapo=True,
             )
+        configure_cache.assert_called_once_with(False)
         assert not impl.enable_mlapo
         assert impl.fused_qkv_a_proj._fused_preprocess_managed == fa_quant_layer
         assert impl.q_proj._fused_preprocess_managed == fa_quant_layer
