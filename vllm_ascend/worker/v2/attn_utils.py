@@ -265,6 +265,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
         if isinstance(attn_module, MLAAttention):
+            speculative_config = getattr(vllm_config, "speculative_config", None)
+            draft_model_config = getattr(speculative_config, "draft_model_config", None)
+            is_k3_dspark_draft = (
+                getattr(attn_module, "is_draft_layer", False)
+                and getattr(speculative_config, "method", None) == "dspark"
+                and getattr(getattr(draft_model_config, "hf_config", None), "model_type", None) == "k3_dspark"
+            )
             cache_sparse_sfa_c8 = False
             cache_sparse_sfa_turboquant = False
             if getattr(attn_module.impl, "fa_quant_layer", False):
@@ -285,6 +292,11 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 )
                 dtype = c8_cache_dtype
                 cache_dtype_str = vllm_config.cache_config.cache_dtype
+            elif is_k3_dspark_draft and attn_module.impl.dtype in (torch.bfloat16, torch.float16):
+                # v0.32.0 has no spec.is_draft; use the owning layer's marker.
+                # An unquantized draft must not inherit target FP8 storage.
+                head_size = spec.head_size
+                dtype, cache_dtype_str = attn_module.impl.dtype, None
             else:
                 head_size = spec.head_size
                 dtype = spec.dtype
@@ -1015,7 +1027,7 @@ def _uses_single_raw_mla_cache(
         return False
     if not kv_cache_spec.supports_single_raw_backing:
         return False
-    if not supports_component_major_mla_pd(vllm_config) or enable_sfa(vllm_config):
+    if not supports_component_major_mla_pd(vllm_config):
         return False
 
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])
@@ -1030,6 +1042,11 @@ def _uses_single_raw_mla_cache(
     if getattr(impl, "use_pcp", False) or getattr(impl, "is_pcp_decode_sharded", False):
         # PCP gathers and sharded-decode writes still use the legacy
         # preprocessing contract. Keep their allocation compatible with it.
+        return False
+    if getattr(impl, "use_quant_flashmla", False):
+        # A dense quantized draft may live under an SFA target configuration.
+        return True
+    if enable_sfa(vllm_config):
         return False
     if getattr(impl, "use_flashmla", False):
         # The external reader retains its fused-cache contract, including
