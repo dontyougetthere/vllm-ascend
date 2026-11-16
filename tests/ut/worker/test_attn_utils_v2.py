@@ -3140,7 +3140,7 @@ def test_k31_dspark_mla_cache_spec_uses_layer_dtype(monkeypatch, quantized):
         block_size=1536,
         num_kv_heads=1,
         head_size=576,
-        dtype=torch.bfloat16,
+        dtype=torch.bfloat16 if quantized else torch.float8_e4m3fn,
         non_causal_multi_token_decode=True,
     )
     layer = MLAAttention.__new__(MLAAttention)

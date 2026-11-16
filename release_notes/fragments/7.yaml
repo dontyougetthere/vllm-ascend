@@ -1,0 +1,8 @@
+pr: 7
+entries:
+  - category: feature
+    text: Added Kimi DSpark C8 decode integration with the existing QuantFlashMLA operators on Ascend A5.
+    model: kimi-dspark
+    hardware: [A5]
+  - category: bugfix
+    text: Fixed draft quantization ownership, FP8 query encoding, and KV writer staging so the default cache configuration does not require an explicit block-size override.
