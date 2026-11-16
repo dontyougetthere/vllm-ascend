@@ -673,10 +673,17 @@ def test_v2_single_raw_mla_path_excludes_unsupported_modes(monkeypatch):
 
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args, **_kwargs: True)
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl.use_quant_flashmla = True
+    assert attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl.use_quant_flashmla = False
+    assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args, **_kwargs: False)
 
     attn_module.impl.fa_quant_layer = True
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl.use_flashmla = True
+    assert attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl.use_flashmla = False
     attn_module.impl.fa_quant_layer = False
 
     attn_module.impl.use_pcp = True
@@ -3125,3 +3132,67 @@ def test_combined_mla_cache_nonzero_offset_preserves_guards_and_slot_padding(dty
     assert k_cache.storage_offset() * k_cache.element_size() == raw_offset_bytes
     assert v_cache.storage_offset() * v_cache.element_size() == raw_offset_bytes + k_block_bytes
     assert k_cache.untyped_storage().data_ptr() == v_cache.untyped_storage().data_ptr() == backing.data_ptr()
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_k31_dspark_mla_cache_spec_uses_layer_dtype(monkeypatch, quantized):
+    source_spec = MLAAttentionSpec(
+        block_size=1536,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16 if quantized else torch.float8_e4m3fn,
+        non_causal_multi_token_decode=True,
+    )
+    layer = MLAAttention.__new__(MLAAttention)
+    layer.impl = SimpleNamespace(
+        fa_quant_layer=quantized,
+        enable_sparse_sfa_c8=False,
+        enable_sparse_sfa_turboquant=False,
+        dtype=torch.float8_e4m3fn if quantized else torch.bfloat16,
+    )
+    layer.num_heads = 96
+    layer.head_size = 512
+    layer.qk_rope_head_dim = 64
+    layer.model_version = None
+    layer.indexes_kv_by_block_stride = False
+    layer.is_draft_layer = True
+    layer.kv_sharing_target_layer_name = None
+    layer.get_kv_cache_spec = lambda _config: source_spec
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="k3_dspark")),
+        ),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(model_type="kimi_linear"),
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
+        cache_config=SimpleNamespace(block_size=1536, cache_dtype="fp8"),
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"model.layers.93.self_attn.attn": layer},
+    )
+    # The surrounding VllmConfig still belongs to the K3.1 SFA target. The
+    # layer-local FA quant flag must take precedence for this DSpark draft.
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: True)
+    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _config: False)
+
+    spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.93.self_attn.attn"]
+
+    assert isinstance(spec, AscendMLAAttentionSpec)
+    # v0.32.0 marks draft layers, but has no is_draft field on the spec.
+    assert layer.is_draft_layer
+    assert spec.num_heads == 1
+    assert spec.head_size == 576
+    assert spec.dtype == (torch.float8_e4m3fn if quantized else torch.bfloat16)
+    assert not spec.cache_sparse_sfa_c8
+    assert not spec.store_on_host
+    assert spec.page_size_bytes == 1536 * 576 * torch.empty((), dtype=spec.dtype).element_size()
+    assert spec.non_causal_multi_token_decode
